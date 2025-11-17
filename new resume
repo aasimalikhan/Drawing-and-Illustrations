@@ -1,0 +1,208 @@
+%-------------------------
+% Resume in Latex
+% Author : Jake Gutierrez
+% Modified by: Strategic Resume Analyst for SDE-II
+% License : MIT
+%------------------------
+
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage{fontawesome5}
+\usepackage{multicol}
+\setlength{\multicolsep}{-3.0pt}
+\setlength{\columnsep}{-1pt}
+\input{glyphtounicode}
+
+%----------FONT OPTIONS----------
+% sans-serif
+% \usepackage[sfdefault]{FiraSans}
+% \usepackage[sfdefault]{roboto}
+% \usepackage[sfdefault]{noto-sans}
+% \usepackage[default]{sourcesanspro}
+
+% serif
+% \usepackage{CormorantGaramond}
+% \usepackage{charter}
+
+
+\pagestyle{fancy}
+\fancyhf{} % clear all header and footer fields
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Adjust margins
+\addtolength{\oddsidemargin}{-0.6in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1.19in}
+\addtolength{\topmargin}{-.7in}
+\addtolength{\textheight}{1.4in}
+
+\urlstyle{same}
+
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% Sections formatting
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large\bfseries
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+% Ensure that generate pdf is machine readable/ATS parsable
+\pdfgentounicode=1
+
+%-------------------------
+% Custom commands
+\newcommand{\resumeItem}[1]{
+  \item\small{
+    {#1 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\classesList}[4]{
+    \item\small{
+        {#1 #2 #3 #4 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{1.0\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & \textbf{\small #2} \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small#1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{1.001\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & \textbf{\small #2}\\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+
+\renewcommand\labelitemi{$\vcenter{\hbox{\tiny$\bullet$}}$}
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.0in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+%-------------------------------------------
+%%%%%%  RESUME STARTS HERE  %%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\begin{document}
+
+%----------HEADING----------
+
+\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+  \textbf{\href{}{\LARGE Aasim Ali Khan}} &  \href{mailto:aasimalikhan54321@gmail.com}{\raisebox{-0.2\height}\faEnvelope\ \underline{aasimalikhan54321@gmail.com}}\\
+  \small \raisebox{-0.1\height}\faPhone\ +91 9121795607 & \href{https://www.linkedin.com/in/aasim-ali-khan-0b1554195/}{\raisebox{-0.2\height}\faLinkedin\ \underline{linkedin.com/in/aasim-ali-khan}} \\
+  \href{https://github.com/aasimalikhan/}{\raisebox{-0.2\height}\faGithub\ \underline{github.com/aasimalikhan}} &  \small{Bengaluru, India}
+\end{tabular*}
+
+\vspace{-5mm}
+
+%-----------EXPERIENCE-----------
+\section{Experience}
+  \resumeSubHeadingListStart
+
+    % VERIZON ENTRY (Assumed Current Role - Check Dates)
+    \resumeSubheading
+      {Software Engineer 2}{April 2024 -- Present} % Fixed date logic (2025 was future)
+      {Verizon}{Hyderabad, Telangana}
+      \resumeItemListStart
+        \resumeItem{Architected a centralized \textbf{Notification Platform} using Spring Boot and RabbitMQ, enabling 25+ internal applications to broadcast high-throughput messages with guaranteed delivery, improving reliability from 72\% to \textbf{99.3\%}.}
+        \resumeItem{Optimized enterprise MySQL workloads by migrating services from MS SQL Server and implementing a \textbf{HikariCP} connection pooling strategy, increasing query throughput by \textbf{45\%} across the cluster.}
+        \resumeItem{Developed a high-performance \textbf{IP Inventory Auditor} using NodeJS and asynchronous DNS checks, reducing manual network validation time from 5 days to \textbf{40 seconds}.}
+        \resumeItem{Automated \textbf{LDAP/Active Directory} Distribution List Management (DLM) via Python scripting, eliminating 20+ hours of manual IT provisioning work per week.}
+        \resumeItem{Engineered a self-healing \textbf{MySQL Router} monitoring script that auto-recovers service failures, reducing production database outages by \textbf{80\%}.}
+      \resumeItemListEnd
+
+    % FISERV ENTRY (The Core Narrative)
+    \resumeSubheading
+      {Technical Analyst (SDE)}{July 2023 -- March 2024}
+      {Fiserv (Fiserv India Ltd.)}{Bengaluru, Karnataka}
+      \resumeItemListStart
+        \resumeItem{Engineered core modules for the \textbf{Fiserv Architect} open banking platform using the internal SDK, enabling the seamless integration of third-party payment APIs for a rollout to \textbf{1,800+ global financial institutions}.}
+        \resumeItem{Architected a real-time data ingestion pipeline using \textbf{Kafka Streams}, processing high-volume banking transaction events with \textbf{zero data loss} and 99.99\% uptime.}
+        \resumeItem{Led the migration of legacy ASP.NET Monoliths to a \textbf{React \& Microservices} architecture, utilizing Recoil for state management; improved application load speeds by \textbf{30\%} and reduced bundle size by 20\%.}
+        \resumeItem{Developed and optimized 15+ RESTful API endpoints using \textbf{Spring Boot}, integrating \textbf{Redis} caching to reduce database load and improve transaction retrieval times by \textbf{25\%}.}
+        \resumeItem{Implemented \textbf{FDIC} regulatory compliance features within the UI, ensuring adherence to federal banking standards for dynamic account protection displays.}
+      \resumeItemListEnd
+
+    % OPTUM ENTRY (Internship)
+    \resumeSubheading
+      {SDE Intern}{May 2022 -- June 2022}
+      {Optum (UnitedHealth Group)}{Hyderabad, Telangana}
+      \resumeItemListStart
+        \resumeItem{Integrated Optum's Centralized Exclusion API to automate the translation of legacy \textbf{X12 EDI 837P} claim transactions into JSON, reducing manual claim verification errors by \textbf{25\%}.}
+        \resumeItem{Deployed and managed containerized microservices on \textbf{Kubernetes} (AWS EKS), implementing Helm charts that reduced deployment turnaround time by \textbf{40\%}.}
+        \resumeItem{Optimized complex SQL queries for the claims database (PostgreSQL), resulting in a \textbf{15\% reduction} in data retrieval latency for the exclusion filter engine.}
+      \resumeItemListEnd
+
+  \resumeSubHeadingListEnd
+
+
+%-----------PROJECTS-----------
+\section{Projects}
+    \resumeSubHeadingListStart
+      \resumeProjectHeading
+          {\textbf{UrbanWardrobe E-Commerce} $|$ \emph{Spring Boot, React, Kafka, Microservices}}{}
+          \resumeItemListStart
+            \resumeItem{Designed a distributed e-commerce backend using \textbf{Spring Boot} microservices, utilizing \textbf{Kafka} for asynchronous order processing and inventory updates.}
+            \resumeItem{Implemented a secure authentication system using \textbf{Spring Security} and JWT (JSON Web Tokens), ensuring role-based access control for admin and user portals.}
+            \resumeItem{Built a responsive frontend using \textbf{React} and Redux, achieving a Lighthouse performance score of 95+.}
+          \resumeItemListEnd
+      \resumeProjectHeading
+          {\textbf{Productivity Tracker} $|$ \emph{MERN Stack, OAuth, Chart.js}}{}
+          \resumeItemListStart
+            \resumeItem{Developed a full-stack time tracking application using the \textbf{MERN Stack} (MongoDB, Express, React, Node), featuring real-time data visualization via Chart.js.}
+            \resumeItem{Integrated \textbf{OAuth 2.0} for secure social login and NodeMailer for automated weekly productivity reports.}
+          \resumeItemListEnd
+    \resumeSubHeadingListEnd
+
+%-----------EDUCATION-----------
+% Moved to bottom as per SDE-II Strategy
+\section{Education}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {Indian Institute of Technology Dharwad (IIT)}{August 2019 -- May 2023}
+      {Bachelor of Technology in Computer Science}{CGPA: [Insert CGPA if > 7.5]}
+  \resumeSubHeadingListEnd
+
+%-----------TECHNICAL SKILLS-----------
+% Moved to bottom for "Clean Closing"
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}]
+    \small{\item{
+     \textbf{Languages}{: Java (Core/Advanced), C++, JavaScript (ES6+), SQL, Python, HTML5, CSS3} \\
+     \textbf{Frameworks}{: Spring Boot, Microservices, ReactJS, Redux, Recoil, NodeJS, Express, Hibernate} \\
+     \textbf{Infrastructure \& Tools}{: Kubernetes, Docker, Apache Kafka, AWS, Git, Jenkins, RabbitMQ, Redis} \\
+     \textbf{Databases}{: PostgreSQL, MySQL, MongoDB, MS SQL Server}
+    }}
+ \end{itemize}
+
+\end{document}
