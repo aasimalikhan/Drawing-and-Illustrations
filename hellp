@@ -1,0 +1,1824 @@
+System Architecture Overview
+The BAS system consists of 4 independent Spring Boot microservices:
+
+Publisher (Port 8282) - REST API for receiving notification requests
+Consumer (Port 8283) - Processes messages and sends to Slack
+Retry (Port 8285) - Handles failed message retry logic with exponential backoff
+Persistence (Port 8284) - Stores notification data and audit logs in database
+Complete Flow Breakdown
+1. Message Initiation (Publisher Service)
+Entry Point: NotificationPublisherController.publishNotification()
+
+Authentication & Authorization:
+
+ApiTokenFilter validates the API token in the Authorization header
+Checks if the groupId from request matches the token's associated group
+Validates group is active and not expired
+Sets validated token in request attributes
+Request Processing:
+
+Validates required fields (messageType, recipient identifier)
+Supports two message types:
+TEMPLATE: Uses predefined templates with optional placeholders
+DIRECT_SLACK: Direct Slack API payload
+Recipient Resolution:
+
+Production: Uses Active Directory lookup service for vzId/eId/emailId → Slack ID
+Non-Production: Uses Slack API lookup for emailId → Slack ID
+Direct slackId can be provided in both environments
+Message Preparation:
+
+For TEMPLATE: Fetches template from database, validates placeholders, applies values
+For DIRECT_SLACK: Validates Slack payload structure
+Creates NotificationPayload with unique queueId and metadata
+Message Publishing:
+
+Publishes NotificationPayload to RabbitMQ exchange with routing key notification.key
+Message goes to notification.publish queue
+2. Message Processing (Consumer Service)
+Entry Point: SlackMessageListener.receiveMessage()
+
+Message Reception:
+
+Listens to notification.publish queue
+Receives NotificationPayload objects
+Slack Message Sending (SlackServiceImpl.sendMessageToSlack()):
+
+Builds ChatPostMessageRequest based on message type
+Uses Slack SDK MethodsClient to send message
+Success Path:
+Sets status to "SENT"
+Creates PersistencePayload with AuditDetails
+Publishes to persist.publish queue
+Failure Path:
+Throws exception → message goes to Dead Letter Queue → retry queue
+3. Retry Mechanism (Retry Service)
+Entry Point: RetryMessageListener.handleFailedMessage()
+
+Failed Message Processing:
+
+Listens to retry.publish queue
+Receives failed NotificationPayload objects from Consumer DLQ
+Retry Logic:
+
+Checks retry count against maxAttempts (default: 3)
+If under limit:
+Increments retry count
+Calculates exponential backoff delay: 2^retryCount seconds
+Schedules retry via ScheduledExecutorService
+If limit exceeded:
+Marks as "FAILED"
+Sends to final Dead Letter Queue (notification.failed.dlq)
+Sends failure alert to Slack log channel
+Retry Execution (RetryServiceImpl.attemptSendToSlack()):
+
+Builds Slack request and attempts to send
+Success: Sends to persistence queue
+Failure: Re-queues for next retry attempt
+4. Data Persistence (Persistence Service)
+Entry Point: NotificationListener.receiveMessage()
+
+Persistence Processing:
+
+Listens to persist.publish queue
+Receives PersistencePayload (contains NotificationPayload + AuditDetails)
+Database Operations (SlackPersistServiceImpl.saveSlackNotification()):
+
+Maps payload to Notifications entity
+Performs upsert operation (update if exists, insert if new)
+Saves to MySQL database table bas_notifications
+Audit Logging (AuditServiceImpl.logAudit()):
+
+Creates NotificationAuditLog entries
+Tracks all events (success, failure, retry attempts)
+Maintains audit trail in database
+Key Infrastructure Components
+RabbitMQ Queues & Routing:
+Exchange: notification.exchange (Topic Exchange)
+Main Queue: notification.publish → Consumer
+Retry Queue: retry.publish → Retry Service
+Persistence Queue: persist.publish → Persistence Service
+Failed DLQ: notification.failed.dlq → Final parking lot
+Database (MySQL):
+Tables: bas_notifications, bas_notification_audit_log, bas_app_groups, bas_message_templates
+Caching: Redis for performance optimization
+Security: Encrypted passwords using Jasypt
+Dead Letter Queue Flow:
+Consumer failure → Message goes to retry queue (DLQ configuration)
+Retry service processes with exponential backoff
+After max attempts → Final DLQ + Slack alert
+Message Flow States
+PENDING → Initial state when message is published
+SENT → Successfully sent to Slack
+FAILED → Failed after all retry attempts
+Security & Multi-tenancy
+Group-based Access: Each request requires valid groupId + matching API token
+Template Isolation: Templates are scoped to groups
+LDAP Integration: User lookup for production environments
+Token Management: Support for multiple tokens per group with expiration
+This architecture provides a robust, scalable notification system with proper error handling, retry mechanisms, audit trails, and multi-tenant security.
+
+
+
+package com.bas.controller;
+
+import com.bas.entity.AppGroupTokens;
+import com.bas.entity.MessageTemplates;
+import com.bas.entity.Notifications;
+import com.bas.model.NotificationPayload;
+import com.bas.model.NotificationStatusDto;
+import com.bas.model.User;
+import com.bas.repo.TemplatePlaceholdersRepository;
+import com.bas.repo.TemplateRepository;
+import com.bas.security.ApiTokenFilter;
+import com.bas.service.AdUserLookupService;
+import com.bas.service.NotificationStatusService;
+import com.bas.service.SlackUserLookupService;
+import com.bas.utils.RequestPayloadConstants;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import com.bas.exception.ResourceNotFoundException;
+
+@RestController
+@RequiredArgsConstructor
+public class NotificationPublisherController {
+
+    @Value("${exchange.name}")
+    private String exchangeName;
+
+    @Value("${routing.key}")
+    private String notificationRoutingKey;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private TemplateRepository templateRepository;
+
+    @Autowired
+    private TemplatePlaceholdersRepository placeholdersRepository;
+
+    @Autowired
+    private AdUserLookupService adUserLookupService;
+    
+    @Autowired
+    private NotificationStatusService notificationStatusService; 
+    
+    @Autowired(required = false) // Optional, as it's only for non-prod
+    private SlackUserLookupService slackUserLookupService;
+
+    @Value("${app.environment.is-prod:false}")
+    private boolean isProd;
+
+    private static final Logger logger = LoggerFactory.getLogger(NotificationPublisherController.class);
+
+    /**
+     * Publishes a new notification message to RabbitMQ for processing.
+     * This endpoint validates template-based messages against the database.
+     */
+    @PostMapping("/notifications")
+    public ResponseEntity<String> publishNotification(@RequestBody Map<String, Object> requestPayload, HttpServletRequest request) {
+        try {
+            // 1. Basic Validation
+            String messageType = (String) requestPayload.get(RequestPayloadConstants.MESSAGE_TYPE);
+            if (messageType == null) {
+                return new ResponseEntity<>("Missing required field: messageType", HttpStatus.BAD_REQUEST);
+            }
+            
+            if (!isProd) {
+                if (requestPayload.containsKey(RequestPayloadConstants.VZ_ID) || requestPayload.containsKey(RequestPayloadConstants.E_ID)) {
+                    return new ResponseEntity<>("vzId and eId are not supported in non-production environments. Please use slackId or emailId.", HttpStatus.BAD_REQUEST);
+                }
+            }
+
+            // 2. Resolve Recipient's Slack ID
+            String recipientSlackId = resolveRecipient(requestPayload);
+            if (recipientSlackId == null) {
+                return new ResponseEntity<>("A valid recipient identifier (slackId, emailId, eId, or vzId) is required and must be valid.", HttpStatus.BAD_REQUEST);
+            }
+            
+            AppGroupTokens validatedToken = (AppGroupTokens) request.getAttribute(ApiTokenFilter.VALIDATED_TOKEN_ATTR);
+            if (validatedToken == null) {
+                // This should not happen if the filter is configured correctly, but it's a good safety check.
+                return new ResponseEntity<>("Could not determine the token used for this request.", HttpStatus.INTERNAL_SERVER_ERROR);
+            }
+
+            // 3. Build the Base Notification Object
+            NotificationPayload notificationPayload = buildBaseNotification(requestPayload, recipientSlackId,validatedToken);
+
+            // 4. Handle Logic Based on Message Type
+            if ("TEMPLATE".equalsIgnoreCase(messageType)) {
+                handleTemplateMessage(notificationPayload, requestPayload);
+            } else if ("DIRECT_SLACK".equalsIgnoreCase(messageType)) {
+                handleDirectSlackMessage(notificationPayload, requestPayload);
+            } else {
+                return new ResponseEntity<>("Invalid messageType: " + messageType, HttpStatus.BAD_REQUEST);
+            }
+
+            // 5. Publish to RabbitMQ
+            rabbitTemplate.convertAndSend(exchangeName, notificationRoutingKey, notificationPayload);
+            logger.info("Notification published to RabbitMQ with queueId: {}", notificationPayload.getQueueId());
+
+            return new ResponseEntity<>("Notification successfully queued: " + notificationPayload.getQueueId(), HttpStatus.OK);
+
+        } catch (IllegalArgumentException e) {
+            // Catch specific validation errors and return a 400 Bad Request
+        	logger.error("Error publishing notification IAE : ", e);
+            return new ResponseEntity<>(e.getMessage(), HttpStatus.BAD_REQUEST);
+        } catch (Exception e) {
+            logger.error("Error publishing notification : ", e);
+            return new ResponseEntity<>("Failed to queue notification due to an internal error.", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+    }
+    
+    /**
+     * Retrieves the status and history of a notification by its queueId.
+     */
+    @GetMapping("/notifications/status/{queueId}")
+    public ResponseEntity<?> getNotificationStatus(@PathVariable("queueId") String queueId) {
+        try {
+            NotificationStatusDto statusDto = notificationStatusService.getStatusByQueueId(queueId);
+            return ResponseEntity.ok(statusDto);
+        } catch (ResourceNotFoundException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(e.getMessage());
+        } catch (Exception e) {
+            logger.error("Error retrieving status for queueId: {}", queueId, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("An internal error occurred.");
+        }
+    }
+
+    /**
+     * Handles the logic for direct Slack messages.
+     */
+    private void handleDirectSlackMessage(NotificationPayload notificationPayload, Map<String, Object> requestPayload) {
+        if (!requestPayload.containsKey("slackContentPayload")) {
+            throw new IllegalArgumentException("DIRECT_SLACK type requires 'slackContentPayload'");
+        }
+        JsonNode slackContentJson = objectMapper.valueToTree(requestPayload.get("slackContentPayload"));
+        if (slackContentJson == null || !slackContentJson.has("text") || slackContentJson.get("text").asText().isBlank()) {
+            throw new IllegalArgumentException("The 'slackContentPayload' must contain a non-empty 'text' field.");
+        }
+        
+        notificationPayload.setSlackContentPayload(slackContentJson);
+        
+        // For DIRECT_SLACK, 'content' might not be relevant or could be a summary
+        // Let's assume it's null or a summary if provided.
+        if (requestPayload.containsKey("content")) {
+        	notificationPayload.setContent((String) requestPayload.get("content"));
+        }
+    }
+    
+    /**
+     * Validates that the keys in the provided map exactly match the required placeholders for a template.
+     */
+    private void validatePlaceholders(Long templateId, Map<String, String> providedPlaceholders) {
+        Set<String> requiredPlaceholders = placeholdersRepository.findPlaceholderNamesByTemplateId(templateId);
+
+        if (!providedPlaceholders.keySet().equals(requiredPlaceholders)) {
+            throw new IllegalArgumentException(
+                "Placeholder mismatch. Required: " + requiredPlaceholders + 
+                ", but you provided: " + providedPlaceholders.keySet());
+        }
+    }
+
+    /**
+     * Creates the initial Notifications object with common fields.
+     */
+    private NotificationPayload buildBaseNotification(Map<String, Object> requestPayload, String recipientSlackId, AppGroupTokens tokenUsed) {
+        LocalDateTime now = LocalDateTime.now();
+        return NotificationPayload.builder()
+                .groupId((String) requestPayload.get(RequestPayloadConstants.GROUP_ID))
+                .slackId(recipientSlackId)
+                .queueId(UUID.randomUUID().toString())
+                .messageType((String) requestPayload.get(RequestPayloadConstants.MESSAGE_TYPE))
+                .status("PENDING")
+                .retryCount(0)
+                .createdAt(now)
+                .updatedAt(now).tokenIdUsed(tokenUsed.getId()).vzId((String) requestPayload.get(RequestPayloadConstants.VZ_ID))
+                .eId((String) requestPayload.get(RequestPayloadConstants.E_ID)).emailId((String) requestPayload.get((RequestPayloadConstants.EMAIL_ID)))
+                .build();
+    }
+
+    /**
+     * Resolves the recipient's Slack ID based on the provided identifiers.
+     */
+    private String resolveRecipient(Map<String, Object> requestPayload) {
+        if (requestPayload.containsKey(RequestPayloadConstants.SLACK_ID)) {
+            return (String) requestPayload.get(RequestPayloadConstants.SLACK_ID);
+        }
+        
+        if (isProd) {
+            // Production logic: Use Active Directory lookup service
+            List<User> userList = Collections.emptyList();
+            if (requestPayload.containsKey(RequestPayloadConstants.EMAIL_ID)) {
+                userList = adUserLookupService.findByEmail((String) requestPayload.get(RequestPayloadConstants.EMAIL_ID));
+            } else if (requestPayload.containsKey(RequestPayloadConstants.E_ID)) {
+                userList = adUserLookupService.findByEid((String) requestPayload.get(RequestPayloadConstants.E_ID));
+            } else if (requestPayload.containsKey(RequestPayloadConstants.VZ_ID)) {
+                userList = adUserLookupService.findByVzid((String) requestPayload.get(RequestPayloadConstants.VZ_ID));
+            }
+            return userList.isEmpty() ? null : userList.get(0).getSlackId();
+        } else {
+            // Non-production logic: Only allow lookup by email via Slack API
+            if (requestPayload.containsKey(RequestPayloadConstants.EMAIL_ID)) {
+                if (slackUserLookupService == null) {
+                     throw new IllegalStateException("SlackUserLookupService is not configured for non-prod environment.");
+                }
+                // Assuming the new service returns the Slack ID directly
+                Optional<String> slackId = slackUserLookupService.findSlackIdByEmail((String) requestPayload.get(RequestPayloadConstants.EMAIL_ID));
+                return slackId.orElse(null);
+            }
+        }
+        
+        return null; 
+    }
+
+    /**
+     * Replaces placeholders in the template string with their actual values.
+     */
+    private String applyPlaceholders(String template, Map<String, String> values) {
+        String result = template;
+        
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            result = result.replace("{" + entry.getKey() + "}", entry.getValue());
+        }
+        return result;
+    }
+    
+    /**
+     * Handles the logic for template-based messages, including validation.
+     * This logic is now enhanced to support templates both with and without placeholders.
+     */
+    private void handleTemplateMessage(NotificationPayload notificationPayload, Map<String, Object> requestPayload) {
+        // Basic validation: A templateId is always required.
+        if (!requestPayload.containsKey(RequestPayloadConstants.TEMPLATE_ID)) {
+            throw new IllegalArgumentException("Template type requires 'templateId'");
+        }
+
+        long templateId = ((Number) requestPayload.get(RequestPayloadConstants.TEMPLATE_ID)).longValue();
+        String groupId = (String) requestPayload.get(RequestPayloadConstants.GROUP_ID);
+
+        // Find the template in the database
+        MessageTemplates template = templateRepository.findByIdAndGroupId(templateId, groupId)
+                .orElseThrow(() -> new IllegalArgumentException("Template not found for the specified templateId and groupId"));
+
+       // Fetch the required placeholders from the database first to decide the logic path.
+        Set<String> requiredPlaceholders = placeholdersRepository.findPlaceholderNamesByTemplateId(template.getId());
+
+        // Conditional logic based on whether placeholders are required.
+        if (requiredPlaceholders.isEmpty()) {
+            // Case 1: Template has NO placeholders. The message is static.
+            // We can ignore the 'placeholderValues' field from the request.
+            notificationPayload.setContent(template.getTemplateText());
+            
+        } else {
+            // Case 2: Template HAS placeholders. This is your existing logic.
+            // We must now validate that the user provided the correct placeholders.
+            if (!requestPayload.containsKey(RequestPayloadConstants.PLACEHOLDER_VALUES)) {
+                throw new IllegalArgumentException(
+                    "This template requires placeholders. The 'placeholderValues' field is missing."
+                );
+            }
+            
+            Map<String, String> providedPlaceholders = (Map<String, String>) requestPayload.get(RequestPayloadConstants.PLACEHOLDER_VALUES);
+            validatePlaceholders(template.getId(), providedPlaceholders);
+            
+            notificationPayload.setPlaceholderValues(providedPlaceholders);
+            notificationPayload.setContent(applyPlaceholders(template.getTemplateText(), providedPlaceholders));
+        }
+
+        // Populate the templateId for the payload in all cases.
+        notificationPayload.setTemplateId(templateId);
+    }
+}
+
+
+package com.bas.service;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.ldap.core.AttributesMapper;
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.core.support.LdapContextSource;
+import org.springframework.stereotype.Service;
+
+import com.bas.controller.NotificationPublisherController;
+import com.bas.enums.SearchType;
+import com.bas.model.User;
+import com.bas.utils.UserAttributesMapper;
+import com.bas.utils.ldapFilters;
+
+import javax.naming.NamingException;
+import javax.naming.directory.Attributes;
+import java.util.List;
+
+/**
+ * Service class for looking up users in Active Directory.
+ */
+@Service
+public class AdUserLookupService {
+	
+	 private static final Logger logger = LoggerFactory.getLogger(AdUserLookupService.class);
+
+    @Autowired
+    private LdapTemplate ldapTemplate;
+
+    // The base DN for your LDAP searches. Modify as needed.
+    private static final String BASE_DN = "DC=VerizonOne,DC=com";
+
+
+    public List<User> findUser(String identifier, SearchType type) {
+        String filter = "";
+		try {
+			filter = ldapFilters.buildFilter(identifier, type);
+		} catch (Exception e) {
+			logger.error("Exception in AdUserLookupService.findUser", e);
+		}
+        return ldapTemplate.search(
+                "",
+                filter,
+                new UserAttributesMapper()
+        );
+    }
+
+
+    public List<User> findByVzid(String vzid) {
+        return findUser(vzid, SearchType.VZID);
+    }
+
+    public List<User> findBySlackId(String slackId) {
+        return findUser(slackId, SearchType.SLACK_ID);
+    }
+
+    public List<User> findByEmail(String email) {
+        return findUser(email, SearchType.EMAIL);
+    }
+
+    public List<User> findByEid(String eid) {
+        return findUser(eid, SearchType.EID);
+    }
+}
+
+
+
+package com.bas.service;
+
+import com.bas.entity.AppGroups; // NEW: Import AppGroups
+import com.bas.entity.Notifications;
+import com.fasterxml.jackson.databind.ObjectMapper; // NEW: Import ObjectMapper
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class CacheService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // NEW: Inject the ObjectMapper for safe type conversions
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    // Using more specific prefixes
+    private final String APPGROUP_KEY_PREFIX = "appgroup:";
+    private final String TEMPLATE_KEY_PREFIX = "template:";
+    private final String NOTIFICATION_KEY_PREFIX = "notification:";
+
+    // --- METHODS FOR AppGroups ---
+
+    // NEW: Caches the entire AppGroups object.
+    public void cacheAppGroup(String groupId, AppGroups appGroup) {
+        redisTemplate.opsForValue().set(APPGROUP_KEY_PREFIX + groupId, appGroup);
+    }
+
+    // NEW: Retrieves the full AppGroups object.
+    public AppGroups getAppGroup(String groupId) {
+        Object rawValue = redisTemplate.opsForValue().get(APPGROUP_KEY_PREFIX + groupId);
+        if (rawValue == null) {
+            return null;
+        }
+        // Safely convert the returned Map into an AppGroups object
+        return objectMapper.convertValue(rawValue, AppGroups.class);
+    }
+
+    // --- METHODS FOR TEMPLATES ---
+    
+    public void cacheTemplateByTemplateAndGroupId(long templateId, String groupId, String template) {
+        redisTemplate.opsForValue().set(TEMPLATE_KEY_PREFIX + templateId + ":" + groupId, template);
+    }
+    
+    public String getTemplateByTemplateAndGroupId(long templateId, String groupId) {
+        return (String) redisTemplate.opsForValue().get(TEMPLATE_KEY_PREFIX + templateId + ":" + groupId);
+    }
+
+    // --- METHODS FOR NOTIFICATIONS ---
+    
+    public void cacheQueueId(String queueId, Notifications notification) {
+        redisTemplate.opsForValue().set(NOTIFICATION_KEY_PREFIX + queueId, notification);
+    }
+
+    // MODIFIED: Uses ObjectMapper for a safe cast to prevent errors.
+    public Notifications getQueue(String queueId) {
+        Object rawValue = redisTemplate.opsForValue().get(NOTIFICATION_KEY_PREFIX + queueId);
+        if (rawValue == null) {
+            return null;
+        }
+        // Safely convert the returned Map into a Notifications object
+        return objectMapper.convertValue(rawValue, Notifications.class);
+    }
+    
+    // NOTE: The old 'getToken' and 'cacheToken' methods have been removed 
+    // as they are replaced by the more powerful getAppGroup/cacheAppGroup methods.
+    // Other unused methods were also removed for clarity.
+}
+
+package com.bas.service;
+
+import com.bas.entity.NotificationAuditLog;
+import com.bas.entity.Notifications;
+import com.bas.exception.ResourceNotFoundException;
+import com.bas.model.AuditLogDto;
+import com.bas.model.NotificationStatusDto;
+import com.bas.repo.NotificationAuditLogRepository;
+import com.bas.repo.NotificationRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class NotificationStatusService {
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private NotificationAuditLogRepository auditLogRepository;
+
+    @Transactional(readOnly = true)
+    public NotificationStatusDto getStatusByQueueId(String queueId) {
+        // Step 1: Find the notification by its queueId
+        Notifications notification = notificationRepository.findByQueueId(queueId)
+                .orElseThrow(() -> new ResourceNotFoundException("Notification not found with queueId: " + queueId));
+
+        // Step 2: Find all its audit logs
+        List<NotificationAuditLog> auditLogs = auditLogRepository.findByNotificationIdOrderByCreatedAtAsc(notification.getId());
+
+        // Step 3: Map the audit log entities to DTOs
+        List<AuditLogDto> history = auditLogs.stream()
+                .map(log -> new AuditLogDto(
+                        log.getEventType(),
+                        log.getStatus(),
+                        log.getLogMessage(),
+                        log.getErrorCode(),
+                        log.getCreatedAt()))
+                .collect(Collectors.toList());
+
+        // Step 4: Build and return the final status DTO
+        return new NotificationStatusDto(
+                notification.getQueueId(),
+                notification.getStatus(),
+                notification.getCreatedAt(),
+                notification.getUpdatedAt(),
+                history
+        );
+    }
+}
+
+
+package com.bas.service;
+
+import java.util.Optional;
+
+public interface SlackUserLookupService {
+
+    /**
+     * Finds a user's Slack ID by their email address by calling the Slack API.
+     *
+     * @param email The email address to look up.
+     * @return An Optional containing the Slack ID (e.g., "U027HQ8B0DB") if found, otherwise an empty Optional.
+     */
+    Optional<String> findSlackIdByEmail(String email);
+}
+
+package com.bas.service;
+
+import com.slack.api.methods.MethodsClient;
+import com.slack.api.methods.SlackApiException;
+import com.slack.api.methods.request.users.UsersLookupByEmailRequest;
+import com.slack.api.methods.response.users.UsersLookupByEmailResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.Optional;
+
+@Service
+public class SlackUserLookupServiceImpl implements SlackUserLookupService {
+
+    private static final Logger logger = LoggerFactory.getLogger(SlackUserLookupServiceImpl.class);
+
+    @Autowired
+    private MethodsClient methodsClient; 
+
+    @Value("${slack.bot.token}")
+    private String slackToken;
+
+    @Override
+    public Optional<String> findSlackIdByEmail(String email) {
+        UsersLookupByEmailRequest request = UsersLookupByEmailRequest.builder()
+            .token(slackToken)
+            .email(email)
+            .build();
+
+        try {
+            // Call the Slack API
+            UsersLookupByEmailResponse response = methodsClient.usersLookupByEmail(request);
+
+            if (response.isOk() && response.getUser() != null) {
+                logger.info("Found Slack ID {} for email {}", response.getUser().getId(), email);
+                return Optional.of(response.getUser().getId());
+            } else {
+                logger.warn("Slack API returned an error for email {}: {}", email, response.getError());
+                return Optional.empty();
+            }
+
+        } catch (SlackApiException e) {
+            if ("users_not_found".equals(e.getError().getError())) {
+                logger.info("Email {} not found in Slack workspace.", email);
+            } else {
+                logger.error("Slack API exception for email {}: {}", email, e.getError());
+            }
+            return Optional.empty();
+        } catch (IOException e) {
+            logger.error("Network IOException while looking up email {}: {}", email, e.getMessage());
+            return Optional.empty();
+        }
+    }
+}
+
+package com.bas.consumer;
+
+
+import com.bas.entity.Notifications;
+import com.bas.model.NotificationPayload;
+import com.bas.service.SlackService;
+
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.stereotype.Component;
+
+@Component
+public class SlackMessageListener {
+
+    @Autowired
+    private SlackService slackService;
+
+    @RabbitListener(queues = "${queue.name}")
+    public void receiveMessage(@Payload NotificationPayload notification) {
+        slackService.sendMessageToSlack(notification);
+    }
+}
+
+
+package com.bas.consumer;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.domain.EntityScan;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication(scanBasePackages = "com.bas.*")
+@EnableScheduling
+@EnableAspectJAutoProxy
+@EntityScan(basePackages =  "com.bas.*")
+public class BotConsumerApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(BotConsumerApplication.class, args);
+	}
+
+}
+
+
+package com.bas.service;
+
+import com.bas.entity.Notifications;
+import com.bas.model.AuditDetails;
+import com.bas.model.NotificationPayload;
+import com.bas.model.PersistencePayload;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.gson.reflect.TypeToken;
+import com.slack.api.methods.MethodsClient;
+import com.slack.api.methods.SlackApiException;
+import com.slack.api.methods.request.chat.ChatPostMessageRequest;
+import com.slack.api.methods.request.chat.ChatPostMessageRequest.ChatPostMessageRequestBuilder;
+import com.slack.api.methods.response.chat.ChatPostMessageResponse;
+import com.slack.api.model.block.LayoutBlock;
+import com.slack.api.util.json.GsonFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.List;
+
+@Service
+public class SlackServiceImpl implements SlackService {
+
+    @Value("${slack.bot.token}")
+    private String slackToken;
+
+    @Value("${exchange.name}")
+    private String exchangeName;
+
+    @Value("${persist.routing.key}")
+    private String persistRoutingKey;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private MethodsClient methodsClient;
+
+    private static final Logger logger = LoggerFactory.getLogger(SlackServiceImpl.class);
+
+    @Override
+    public void sendMessageToSlack(NotificationPayload notificationPayload) {
+        try {
+            // FOR TESTING: Simulate a transient failure on the FIRST attempt only.
+//            if (notificationPayload.getRetryCount() == null || notificationPayload.getRetryCount() == 0) {
+//                logger.warn(">>> FORCING A TRANSIENT FAILURE for queueId: {} (First Attempt) <<<", notificationPayload.getQueueId());
+//                throw new RuntimeException("Simulating a transient failure to test the retry queue.");
+//            }
+            
+            ChatPostMessageRequest request = buildSlackRequest(notificationPayload);
+            
+            if (request == null) {
+                throw new IllegalArgumentException("Could not build Slack request due to unsupported messageType or invalid data.");
+            }
+
+            request.setToken(slackToken);
+
+            logger.info("Attempting to send message to Slack for queueId: {}", notificationPayload.getQueueId());
+            ChatPostMessageResponse response = methodsClient.chatPostMessage(request);
+
+            if (response.isOk()) {
+                logger.info("Slack message sent successfully for queueId: {}", notificationPayload.getQueueId());
+                notificationPayload.setStatus("SENT");
+                // Create the audit details for this specific event
+                AuditDetails auditDetails = new AuditDetails(
+                    "INITIAL_ATTEMPT_SUCCESS",  // eventType
+                    response.toString(),        // response
+                    null,                       // errorCode
+                    "Message sent successfully."// logMessage
+                );
+                
+                // Create the payload and send it
+                PersistencePayload payload = new PersistencePayload(notificationPayload, auditDetails);
+                
+                rabbitTemplate.convertAndSend(exchangeName, persistRoutingKey, payload);
+            } else {
+                logger.error("Slack API returned a non-OK response: {}", response.getError());
+                throw new RuntimeException("Slack API error: " + response.getError());
+            }
+
+        } catch (SlackApiException | IOException e) {
+            logger.error("Failed to send message to Slack due to an API or network error: {}", e.getMessage());
+            throw new RuntimeException("A recoverable error occurred while sending to Slack.", e);
+        } catch (Exception e) {
+            logger.error("An unexpected error occurred while processing Slack message: {}", e.getMessage(), e);
+            throw new RuntimeException("An unexpected error occurred.", e);
+        }
+    }
+
+    private ChatPostMessageRequest buildSlackRequest(NotificationPayload notification) {
+        if ("TEMPLATE".equalsIgnoreCase(notification.getMessageType())) {
+            return ChatPostMessageRequest.builder()
+                    .channel(notification.getSlackId())
+                    .text(notification.getContent())
+                    .build();
+        } else if ("DIRECT_SLACK".equalsIgnoreCase(notification.getMessageType())) {
+            ObjectNode payload = (ObjectNode) notification.getSlackContentPayload();
+            if (payload == null  || !payload.has("text")) {
+                 logger.error("DIRECT_SLACK payload is missing required fields 'channel' or 'text'.");
+                 return null;
+            }
+            ChatPostMessageRequestBuilder requestBuilder = ChatPostMessageRequest.builder()
+                    .channel(notification.getSlackId())
+                    .text(payload.get("text").asText());
+            if (payload.has("username")) {
+                requestBuilder.username(payload.get("username").asText());
+            }
+            if (payload.has("icon_emoji")) {
+                requestBuilder.iconEmoji(payload.get("icon_emoji").asText());
+            }
+            if (payload.has("unfurl_links")) {
+                requestBuilder.unfurlLinks(payload.get("unfurl_links").asBoolean());
+            }
+            if (payload.has("blocks") && payload.get("blocks").isArray()) {
+                String blocksAsJsonString = payload.get("blocks").toString();
+                List<LayoutBlock> blocks = GsonFactory.createSnakeCase().fromJson(blocksAsJsonString, new TypeToken<List<LayoutBlock>>() {}.getType());
+                requestBuilder.blocks(blocks);
+            }
+            return requestBuilder.build();
+        } else {
+            logger.error("Unsupported messageType: {}", notification.getMessageType());
+            return null;
+        }
+    }
+}
+
+package com.bas.retry;
+
+import com.bas.entity.Notifications;
+import com.bas.model.NotificationPayload;
+import com.bas.service.RetryService;
+import com.bas.service.RetryServiceImpl;
+
+import lombok.extern.slf4j.Slf4j;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.stereotype.Component;
+
+@Component
+public class RetryMessageListener {
+
+    @Autowired
+    private RetryService retryService;
+
+    @Value("${retry.maxAttempts:3}")
+    private int maxAttempts;
+
+    @Value("${exchange.name}")
+    private String exchangeName;
+    
+    private static final Logger log = LoggerFactory.getLogger(RetryMessageListener.class);
+    
+    @RabbitListener(queues = "${retry.queue.name}")
+    public void handleFailedMessage(@Payload NotificationPayload notificationPayload) {
+        try {
+            if (notificationPayload.getRetryCount() == null) {
+            	notificationPayload.setRetryCount(0);
+            }
+            
+            log.info("Processing retry message for queueId: {}. Current attempt count: {}", notificationPayload.getQueueId(), notificationPayload.getRetryCount());
+
+            if (notificationPayload.getRetryCount() < maxAttempts) {
+                int nextRetryCount = notificationPayload.getRetryCount() + 1;
+                notificationPayload.setRetryCount(nextRetryCount);
+                // Exponential backoff: 2s, 4s, 8s, ...
+                long delay = (long) Math.pow(2, nextRetryCount) * 1000;
+
+                log.info("Scheduling attempt {} of {} for queueId: {} with delay {} ms", nextRetryCount, maxAttempts, notificationPayload.getQueueId(), delay);
+                retryService.scheduleRetry(notificationPayload, delay);
+            } else {
+                log.error("Max retry attempts ({}) reached for message: {}. Marking as failed.", maxAttempts, notificationPayload);
+                retryService.markAsFailed(notificationPayload);
+            }
+        } catch (Exception e) {
+            log.error("Error processing retry message for notification: {}", notificationPayload, e);
+        }
+    }
+}
+
+package com.bas.service;
+
+import com.bas.entity.Notifications;
+import com.bas.model.AuditDetails;
+import com.bas.model.NotificationPayload;
+import com.bas.model.PersistencePayload;
+import com.bas.repo.NotificationRepository;
+import com.bas.retry.RetryMessageListener;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.gson.reflect.TypeToken;
+import com.slack.api.methods.MethodsClient;
+import com.slack.api.methods.SlackApiException;
+import com.slack.api.methods.request.chat.ChatPostMessageRequest;
+import com.slack.api.methods.request.chat.ChatPostMessageRequest.ChatPostMessageRequestBuilder;
+import com.slack.api.methods.response.chat.ChatPostMessageResponse;
+import com.slack.api.model.block.LayoutBlock;
+import com.slack.api.util.json.GsonFactory;
+import jakarta.transaction.Transactional;
+import lombok.extern.slf4j.Slf4j;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class RetryServiceImpl implements RetryService {
+
+    @Value("${slack.bot.token}")
+    private String slackToken;
+
+    @Value("${exchange.name}")
+    private String exchangeName;
+
+    @Value("${retry.routing.key}")
+    private String retryRoutingKey;
+
+    @Value("${persist.routing.key}")
+    private String persistRoutingKey;
+    
+    @Value("${failed.routing.key}")
+    private String failedRoutingKey;
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private CacheService cacheService;
+    
+    @Autowired
+    private MethodsClient methodsClient;
+    
+    @Value("${slack.log.channel.id}")
+    private String slackLogChannelId;
+    
+    private static final Logger log = LoggerFactory.getLogger(RetryServiceImpl.class);
+
+    @Autowired
+    private ScheduledExecutorService delayedRetryScheduler;
+
+    /**
+     * This method is called by the RetryMessageListener.
+     * It schedules the actual send attempt to happen after the calculated delay.
+     * IT DOES NOT BLOCK.
+     */
+    @Override
+    public void scheduleRetry(NotificationPayload notificationPayload, long delayMillis) {
+        log.info("Scheduling a retry for queueId: {} with a delay of {} ms", notificationPayload.getQueueId(), delayMillis);
+        try {
+            delayedRetryScheduler.schedule(() -> attemptSendToSlack(notificationPayload), delayMillis, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.error("Failed to schedule a retry for queueId: {}. Marking as FAILED.", notificationPayload.getQueueId(), e);
+            markAsFailed(notificationPayload);
+        }
+    }
+
+    /**
+     * This private method contains the core logic to build and send the message.
+     * If it fails, it sends the message back to the retry queue for the listener to process again.
+     */
+    private void attemptSendToSlack(NotificationPayload notificationPayload) {
+        try {
+        	   // FOR TESTING: Simulate a transient failure on the FIRST attempt only.
+//            if (notificationPayload.getRetryCount() != 0) {
+//                log.warn(">>> FORCING A TRANSIENT FAILURE for queueId: {} (First Attempt) <<<", notificationPayload.getQueueId());
+//                throw new RuntimeException("Simulating a transient failure to test the retry queue.");
+//            }
+            ChatPostMessageRequest request = buildSlackRequest(notificationPayload);
+            if (request == null) {
+                log.error("Failed to build Slack request for queueId: {}. Marking as FAILED.", notificationPayload.getQueueId());
+                notificationPayload.setErrorMessage("Failed to build Slack request, messageType is likely unsupported.");
+                markAsFailed(notificationPayload);
+                return;
+            }
+            request.setToken(slackToken);
+            
+            log.info("Attempting to send message for queueId: {}", notificationPayload.getQueueId());
+            ChatPostMessageResponse response = methodsClient.chatPostMessage(request);
+
+            if (response.isOk()) {
+                log.info("Slack message sent successfully for queueId: {}. Sending to persistence queue.", notificationPayload.getQueueId());
+                notificationPayload.setStatus("SENT");
+                
+                AuditDetails auditDetails = new AuditDetails(
+                        "RETRY_SUCCESS",
+                        response.toString(),
+                        null,
+                        "Message sent successfully on retry attempt " + notificationPayload.getRetryCount()
+                    );
+                
+                PersistencePayload payload = new PersistencePayload(notificationPayload, auditDetails);
+               
+                rabbitTemplate.convertAndSend(exchangeName, persistRoutingKey, payload);
+            } else {
+                log.error("Slack API returned a non-ok response: {}. Re-queueing for retry.", response.getError());
+                notificationPayload.setErrorMessage(response.getError());
+                requeueForNextAttempt(notificationPayload);
+            }
+
+        } catch (SlackApiException e) {
+            log.warn("Slack API Exception during retry attempt: {}. Re-queueing message for queueId: {}", e.getError(), notificationPayload.getQueueId());
+            notificationPayload.setErrorMessage("Slack API Error: " + e.getError().getError() + " | Response: " + e.getResponseBody());
+            requeueForNextAttempt(notificationPayload);
+        } catch (IOException e) {
+            log.error("Network error during retry attempt: {}. Re-queueing message for queueId: {}", e.getMessage(), notificationPayload.getQueueId());
+            notificationPayload.setErrorMessage("IOException: " + e.getMessage());
+            requeueForNextAttempt(notificationPayload);
+        } catch (Exception e) {
+            log.error("Unexpected error during retry attempt for queueId: {}. Re-queueing message.", notificationPayload.getQueueId(), e);
+            notificationPayload.setErrorMessage("Unexpected Exception: " + e.getMessage());
+            requeueForNextAttempt(notificationPayload);
+        }
+    }
+
+    private void requeueForNextAttempt(NotificationPayload notificationPayload) {
+        // Send the message back to the retry queue. The listener will decide if it has more attempts left.
+        rabbitTemplate.convertAndSend(exchangeName, retryRoutingKey, notificationPayload);
+    }
+    
+    /**
+     * Helper method to build the ChatPostMessageRequest based on the notification type.
+     */
+    private ChatPostMessageRequest buildSlackRequest(NotificationPayload notificationPayload) {
+        // Using cache and DB lookup from your original code
+//        Notifications notificationQueue = cacheService.getQueue(notificationPayload.getQueueId());
+//        if (notificationQueue == null || notificationQueue.getId() == null) {
+//            List<Notifications> notificationList = notificationRepository.findByQueueId(notificationPayload.getQueueId());
+//            if (!notificationList.isEmpty()) {
+//                notificationQueue = notificationList.get(0);
+//                cacheService.cacheQueueId(notificationPayload.getQueueId(), notificationQueue);
+//            }
+//        }
+//        if (notificationPayload.getId() == null && (notificationQueue != null)) {
+//        	notificationPayload.setId(notificationQueue.getId());
+//        }
+
+        if ("TEMPLATE".equalsIgnoreCase(notificationPayload.getMessageType())) {
+            return ChatPostMessageRequest.builder()
+                    .channel(notificationPayload.getSlackId())
+                    .text(notificationPayload.getContent())
+                    .build();
+        } else if ("DIRECT_SLACK".equalsIgnoreCase(notificationPayload.getMessageType())) {
+            ObjectNode payload = (ObjectNode) notificationPayload.getSlackContentPayload();
+            ChatPostMessageRequestBuilder requestBuilder = ChatPostMessageRequest.builder()
+                    .channel(payload.get("channel").asText())
+                    .text(payload.get("text").asText());
+
+            if (payload.has("username")) requestBuilder.username(payload.get("username").asText());
+            if (payload.has("icon_emoji")) requestBuilder.iconEmoji(payload.get("icon_emoji").asText());
+            if (payload.has("unfurl_links")) requestBuilder.unfurlLinks(payload.get("unfurl_links").asBoolean());
+
+            if (payload.has("blocks") && payload.get("blocks").isArray()) {
+                String blocksAsJsonString = payload.get("blocks").toString();
+                List<LayoutBlock> blocks = GsonFactory.createSnakeCase().fromJson(blocksAsJsonString, new TypeToken<List<LayoutBlock>>() {}.getType());
+                requestBuilder.blocks(blocks);
+            }
+            return requestBuilder.build();
+        } else {
+            log.error("Unsupported messageType: {} for queueId: {}", notificationPayload.getMessageType(), notificationPayload.getQueueId());
+            return null;
+        }
+    }
+
+    @Override
+    @Transactional
+    public void markAsFailed(NotificationPayload notificationPayload) {
+        LocalDateTime now = LocalDateTime.now();
+        notificationPayload.setStatus("FAILED");
+        notificationPayload.setUpdatedAt(now);
+
+        String finalLogMessage = "Message failed all " + notificationPayload.getRetryCount() + " retry attempts. Last known error: " + notificationPayload.getErrorMessage();
+        
+        AuditDetails auditDetails = new AuditDetails(
+                "FINAL_FAILURE_MAX_ATTEMPTS",
+                notificationPayload.getErrorMessage(), // Use the last error as the "response"
+                "MAX_ATTEMPTS",
+                finalLogMessage // Use the new, more descriptive message
+            );
+            PersistencePayload payload = new PersistencePayload(notificationPayload, auditDetails);
+            
+            
+        // Persist the final "FAILED" state
+        rabbitTemplate.convertAndSend(exchangeName, persistRoutingKey, payload);
+        log.warn("Slack notification marked as FAILED and sent to persistQueue: {}", notificationPayload);
+        
+        rabbitTemplate.convertAndSend(exchangeName, failedRoutingKey, notificationPayload);
+        log.warn("Message for queueId {} moved to the final Dead-Letter Queue.", notificationPayload.getQueueId());
+        
+        sendFailureAlertToLogChannel(notificationPayload);
+    }
+    
+    
+ // In RetryServiceImpl.java
+
+    /**
+     * This is a "fire-and-forget" call; if it fails, it just logs a warning
+     * and does not interrupt the main process.
+     */
+    private void sendFailureAlertToLogChannel(NotificationPayload notificationPayload) {
+        if (slackLogChannelId == null || slackLogChannelId.isBlank()) {
+            log.warn("slack.log.channel.id is not configured. Cannot send failure alert.");
+            return;
+        }
+
+        try {
+        	String messageText = String.format(
+        		    "<!channel> 🚨 *Notification Failure Alert*\n" +
+        		    "> A notification has failed all retry attempts and requires manual intervention.\n\n" +
+        		    "*Service:* `Retry Service`\n" +
+        		    "*Queue ID:* `%s`\n" +
+        		    "*Recipient Slack ID:* `%s`\n" +
+        		    "*Last Known Error:* ```%s```\n" +
+        		    "The message has been moved to the `%s` queue for inspection.",
+        		    notificationPayload.getQueueId(),
+        		    notificationPayload.getSlackId(),
+        		    notificationPayload.getErrorMessage() != null ? notificationPayload.getErrorMessage() : "N/A",
+        		    "notification.failed.dlq" 
+        		);
+
+            ChatPostMessageRequest request = ChatPostMessageRequest.builder()
+                .channel(slackLogChannelId)
+                .text(messageText)
+                .build();
+            
+            request.setToken(slackToken);
+            methodsClient.chatPostMessage(request);
+            
+            log.info("Successfully sent failure alert to log channel for queueId: {}", notificationPayload.getQueueId());
+
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to send failure alert to the Slack log channel for queueId: {}", notificationPayload.getQueueId(), e);
+        }
+    }
+}
+
+package com.bas.entity;
+
+import com.bas.config.JsonNodeConverter;
+import com.bas.config.StringToStringMapConverter;
+import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+import java.time.LocalDateTime;
+import java.util.Map;
+
+@Entity
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+@Table(name="bas_notifications")
+public class Notifications implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name="group_id", nullable = false, length = 64)
+    private String groupId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "token_id_used", referencedColumnName = "id")
+    private AppGroupTokens tokenUsed;
+
+    @Column(name="template_id")
+    private Long templateId;
+
+    @Column(name="slackId", length = 64)
+    private String slackId;
+
+    @Column(name = "placeholder_values", columnDefinition = "LONGTEXT")
+    @Convert(converter = StringToStringMapConverter.class)
+    private Map<String, String> placeholderValues;
+
+    @Column(name="status", length = 20)
+    private String status;
+
+    @Column(name="retry_count")
+    private Integer retryCount;
+
+    @Column(name="created_at")
+    private LocalDateTime createdAt;
+
+    @Column(name="updated_at")
+    private LocalDateTime updatedAt;
+
+    @Column(name="sent_at")
+    private LocalDateTime sentAt;
+
+    @Column(name="error_message", columnDefinition = "LONGTEXT")
+    private String errorMessage;
+
+    @Column(name="content", columnDefinition = "LONGTEXT")
+    private String content;
+
+    @Column(name="queue_id", columnDefinition = "LONGTEXT")
+    private String queueId;
+
+    @Column(name="message_type", length = 20)
+    private String messageType;
+
+    @Column(name = "slack_content_payload", columnDefinition = "LONGTEXT")
+    @Convert(converter = JsonNodeConverter.class)
+    private JsonNode slackContentPayload;
+
+    @Column(name="vzId", length=255)
+    private String vzId;
+
+    @Column(name="eId", length=255)
+    private String eId;
+
+    @Column(name="emailId", length=255)
+    private String emailId;
+}
+
+
+package com.bas.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Table(name = "bas_notification_audit_logs")
+public class NotificationAuditLog {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    // This creates the link back to the parent Notification.
+    // LAZY fetch is a good practice for performance.
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "notification_id", nullable = false)
+    private Notifications notification;
+
+    @Column(name = "event_type", nullable = false, length = 50)
+    private String eventType; 
+
+    @Column(name = "status", nullable = false, length = 20)
+    private String status; 
+
+    @Column(name = "response", columnDefinition = "TEXT")
+    private String response; 
+    @Column(name = "error_code", length = 50)
+    private String errorCode;
+
+    @Column(name = "log_message", columnDefinition = "LONGTEXT")
+    private String logMessage;
+
+    @CreationTimestamp
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+}
+
+package com.bas.repo;
+
+import java.util.List;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import com.bas.entity.Notifications;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notifications, Long> {
+	
+	List<Notifications> findByQueueId(String queueId);
+	
+	
+}
+
+
+package com.bas.config;
+
+// Add these new imports
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+@Configuration
+@EnableCaching
+public class RedisConfig {
+    
+    @Value("${spring.redis.host}")
+    private String redisHost;
+    @Value("${spring.redis.port}")
+    private int redisPort;
+
+    @Bean
+    public RedisConnectionFactory redisConnectionFactory() {
+        return new LettuceConnectionFactory(redisHost, redisPort);
+    }
+
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(connectionFactory);
+
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new JavaTimeModule());
+        objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+
+        // This serializer includes type information by default
+        GenericJackson2JsonRedisSerializer jsonRedisSerializer = new GenericJackson2JsonRedisSerializer(objectMapper);
+
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(jsonRedisSerializer);
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setHashValueSerializer(jsonRedisSerializer);
+        
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+
+package com.bas.config;
+
+import org.springframework.amqp.core.AmqpTemplate;
+import org.springframework.amqp.core.Binding;
+import org.springframework.amqp.core.BindingBuilder;
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.amqp.core.TopicExchange;
+import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
+import org.springframework.amqp.rabbit.connection.ConnectionFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class MessagingConfig {
+
+	@Value("${queue.name}")
+	private String queueName; // e.g., notification.publish
+	@Value("${retry.queue.name}")
+	private String retryQueueName; // e.g., retry.publish
+	@Value("${persist.queue.name}")
+	private String persistQueueName; // e.g., persist.publish
+
+	@Value("${exchange.name}")
+	private String exchangeName; // e.g., notification.exchange
+
+	@Value("${routing.key}")
+	private String routingKey; // e.g., notification.key
+	@Value("${retry.routing.key}")
+	private String retryRoutingKey; // e.g., retry.key
+	@Value("${persist.routing.key}")
+	private String persistRoutingKey; // e.g., persist.key
+	
+	@Value("${failed.queue.name}")
+	private String failedQueueName;
+	@Value("${failed.routing.key}")
+	private String failedRoutingKey;
+
+	// The main consumer queue with dead-lettering configured
+	@Bean
+	public Queue queue() {
+		return QueueBuilder.durable(queueName)
+				.withArgument("x-dead-letter-exchange", exchangeName)
+				.withArgument("x-dead-letter-routing-key", retryRoutingKey)
+				.build();
+	}
+
+	// The retry queue (simple durable queue)
+	@Bean
+	public Queue retryQueue() {
+		return QueueBuilder.durable(retryQueueName).build();
+	}
+
+	// The persistence queue (simple durable queue)
+	@Bean
+	public Queue persistQueue() {
+		return QueueBuilder.durable(persistQueueName).build();
+	}
+	
+	@Bean
+	public Queue failedQueue() {
+		return QueueBuilder.durable(failedQueueName).build();
+	}
+
+	// The single, shared exchange
+	@Bean
+	public TopicExchange exchange() {
+		return new TopicExchange(exchangeName);
+	}
+	
+	// The binding for the main queue
+	@Bean
+	public Binding binding(@Qualifier("queue") Queue queue, TopicExchange exchange) {
+		return BindingBuilder.bind(queue).to(exchange).with(routingKey);
+	}
+
+	// The binding for the retry queue
+	@Bean
+	public Binding retryBinding(@Qualifier("retryQueue") Queue retryQueue, TopicExchange exchange) {
+		return BindingBuilder.bind(retryQueue).to(exchange).with(retryRoutingKey);
+	}
+
+	// The binding for the persistence queue
+	@Bean
+	public Binding persistBinding(@Qualifier("persistQueue") Queue persistQueue, TopicExchange exchange) {
+		return BindingBuilder.bind(persistQueue).to(exchange).with(persistRoutingKey);
+	}
+	
+	@Bean
+	public Binding failedBinding(@Qualifier("failedQueue") Queue failedQueue, TopicExchange exchange) {
+		return BindingBuilder.bind(failedQueue).to(exchange).with(failedRoutingKey);
+	}
+
+	@Bean
+	public MessageConverter converter() {
+		return new Jackson2JsonMessageConverter();
+	}
+
+	@Bean
+	public AmqpTemplate template(ConnectionFactory connectionFactory) {
+		final RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+		rabbitTemplate.setMessageConverter(converter());
+		return rabbitTemplate;
+	}
+	
+	// Listener Factory that applies to all @RabbitListener annotations
+	@Bean
+	public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(ConnectionFactory connectionFactory) {
+		var factory = new SimpleRabbitListenerContainerFactory();
+		factory.setConnectionFactory(connectionFactory);
+		factory.setMessageConverter(converter());
+		// This is the critical setting to prevent infinite loops
+		factory.setDefaultRequeueRejected(false);
+		return factory;
+	}
+}
+
+package com.bas.perisistence;
+
+import com.bas.entity.Notifications;
+import com.bas.model.PersistencePayload;
+import com.bas.repo.NotificationRepository;
+import com.bas.service.SlackPersistService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
+import java.time.LocalDateTime;
+import java.util.Map;
+
+@Component
+public class NotificationListener {
+	
+	@Autowired
+	private SlackPersistService slackPersistService;
+
+    private  NotificationRepository repository;
+    private  ObjectMapper mapper;
+
+    @RabbitListener(queues = "${persist.queue.name}")
+    public void receiveMessage(@Payload PersistencePayload payload) {
+    	slackPersistService.saveSlackNotification(payload);
+    }
+}
+
+
+package com.bas.service;
+
+import com.bas.entity.AppGroupTokens;
+import com.bas.entity.Notifications;
+import com.bas.helper.Helper;
+import com.bas.model.AuditDetails;
+import com.bas.model.NotificationPayload;
+import com.bas.model.PersistencePayload;
+import com.bas.repo.AppGroupTokensRepository;
+import com.bas.repo.NotificationRepository;
+import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional; // IMPROVEMENT: Import added
+
+@Service
+public class SlackPersistServiceImpl implements SlackPersistService {
+
+    private static final Logger logger = LoggerFactory.getLogger(SlackPersistServiceImpl.class);
+
+    @Autowired
+    private NotificationRepository notificationRepository;
+
+    @Autowired
+    private CacheService cacheService;
+    
+    @Autowired
+    private AuditService auditService;
+    
+	@Autowired
+	AppGroupTokensRepository tokenRepository;
+
+    @Override
+    @Transactional // IMPROVEMENT: Ensures the entire method is a single, safe database operation.
+    public void saveSlackNotification(PersistencePayload payload) {
+        try {
+            NotificationPayload notificationPayload = payload.getNotificationPayload();
+            AuditDetails auditDetails = payload.getAuditDetails();
+            
+            // Check cache for an existing record
+//            Notifications existingNotification = cacheService.getQueue(notificationPayload.getQueueId());
+//
+//            // If not in cache, check the database
+//            if (existingNotification == null || existingNotification.getId() == null) {
+//                List<Notifications> notificationList = notificationRepository.findByQueueId(
+//                		notificationPayload.getQueueId()
+//                );
+//                if (!notificationList.isEmpty()) {
+//                    existingNotification = notificationList.get(0);
+//                    // Update cache with the record from the database
+//                    cacheService.cacheQueueId(
+//                    		notificationPayload.getQueueId(),
+//                        existingNotification
+//                    );
+//                }
+//            }
+//
+//            // If an existing record was found, copy its ID to ensure an UPDATE, not an INSERT.
+//            if (notificationPayload.getId() == null && (existingNotification != null)) {
+//            	notificationPayload.setId(existingNotification.getId());
+//            }
+
+            Notifications notificationToSave = notificationRepository
+                .findByQueueId(notificationPayload.getQueueId())
+                .orElseGet(Notifications::new);
+
+            mapPayloadToEntity(notificationPayload, notificationToSave);
+
+            Notifications savedNotification = notificationRepository.saveAndFlush(notificationToSave);
+            
+            logger.info("Notification successfully persisted for queueId: {}", savedNotification.getQueueId());
+            
+            auditService.logAudit(savedNotification,auditDetails.getEventType(),auditDetails.getLogMessage(),auditDetails.getErrorCode(),auditDetails.getResponse());
+        } catch (Exception e) {
+            logger.error(
+                "Exception in saveSlackNotification for queueId: {}",
+                payload.getNotificationPayload().getQueueId(),
+                e // Pass the full exception here
+            );
+            throw new RuntimeException("An unexpected error occurred.", e);
+        }
+    }
+    
+    private void mapPayloadToEntity(NotificationPayload payload, Notifications entity) {
+        entity.setGroupId(payload.getGroupId());
+        entity.setTemplateId(payload.getTemplateId());
+        entity.setSlackId(payload.getSlackId());
+        entity.setPlaceholderValues(payload.getPlaceholderValues());
+        entity.setStatus(payload.getStatus());
+        entity.setRetryCount(payload.getRetryCount());
+        entity.setCreatedAt(payload.getCreatedAt());
+        entity.setUpdatedAt(payload.getUpdatedAt());
+        entity.setSentAt(payload.getSentAt());
+        entity.setErrorMessage(payload.getErrorMessage());
+        entity.setContent(payload.getContent());
+        entity.setQueueId(payload.getQueueId());
+        entity.setMessageType(payload.getMessageType());
+        entity.setSlackContentPayload(payload.getSlackContentPayload());
+        entity.setVzId(payload.getVzId());
+        entity.setEId(payload.getEId());
+        entity.setEmailId(payload.getEmailId());
+        
+        // Handle the token relationship
+        if (payload.getTokenIdUsed() != null && entity.getTokenUsed() == null) {
+            AppGroupTokens tokenUsed = tokenRepository.findById(payload.getTokenIdUsed()).orElse(null);
+            entity.setTokenUsed(tokenUsed);
+        }
+    }
+}
+
+package com.bas.service;
+
+import com.bas.entity.Notifications;
+import com.bas.model.PersistencePayload;
+
+public interface SlackPersistService {
+	 public void saveSlackNotification(PersistencePayload payload);
+}
+
+
+package com.bas.service;
+
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+
+import com.bas.entity.Notifications;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+
+@Service
+public class CacheService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    private final String TOKEN_KEY_PREFIX = "queueID:";
+
+    public void cacheQueueId(String queue, Notifications notification) {
+        redisTemplate.opsForValue().set(TOKEN_KEY_PREFIX + queue, notification);
+    }
+
+    public Notifications getQueue(String queueId) {
+    	// Retrieve the raw value, which will likely be a LinkedHashMap
+        Object rawValue = redisTemplate.opsForValue().get(TOKEN_KEY_PREFIX + queueId);
+
+        if (rawValue == null) {
+            return null; // Key doesn't exist, return null
+        }
+
+        return objectMapper.convertValue(rawValue, Notifications.class);
+    }
+
+}
+
+
+package com.bas.service;
+
+import com.bas.entity.NotificationAuditLog;
+import com.bas.entity.Notifications;
+import com.bas.repo.NotificationAuditLogRepository;
+import com.bas.repo.NotificationRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class AuditServiceImpl implements AuditService {
+
+    private static final Logger logger = LoggerFactory.getLogger(AuditServiceImpl.class);
+
+    @Autowired
+    private NotificationAuditLogRepository auditLogRepository;
+
+    @Autowired
+    private NotificationRepository notificationRepository; // To fetch the parent notification
+
+    @Override
+    @Transactional
+    public void logAudit(Notifications notification, String eventType, String logMessage, String errorcode, String response) {
+        createAndSaveLog(notification, eventType, notification.getStatus(), logMessage, errorcode, response);
+    }
+
+    /**
+     * Private helper method to find the parent notification and save the log entry.
+     */
+    private void createAndSaveLog(Notifications notification, String eventType, String status, String logMessage, String errorCode, String response) {
+        try {
+            // Find the parent notification to establish the relationship
+//            Notifications parentNotification = notificationRepository.findById(notificationId)
+//                    .orElseThrow(() -> new IllegalArgumentException("Notification not found with id: " + notificationId));
+
+            // Build the new audit log entry
+            NotificationAuditLog auditLog = NotificationAuditLog.builder()
+                    .notification(notification)
+                    .eventType(eventType)
+                    .status(status)
+                    .logMessage(logMessage)
+                    .errorCode(errorCode)
+                    .response(response)
+                    .build();
+
+            // Save the log to the database
+            auditLogRepository.save(auditLog);
+
+        } catch (Exception e) {
+            // Log an error if the auditing fails, but don't crash the main process.
+            logger.error("Failed to save audit log for notificationId {}: {}", notification.getId(), e.getMessage());
+        }
+    }
+}
+
+package com.bas.config;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
+
+
+
+@Converter(autoApply = true)
+public class JsonNodeConverter implements AttributeConverter<JsonNode, String> {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public String convertToDatabaseColumn(JsonNode attribute) {
+        if (attribute == null) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(attribute);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Error converting JsonNode to String", e);
+        }
+    }
+
+    @Override
+    public JsonNode convertToEntityAttribute(String dbData) {
+        if (dbData == null || dbData.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.readTree(dbData);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Error converting String to JsonNode", e);
+        }
+    }
+}
+
